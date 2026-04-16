@@ -14,183 +14,216 @@ SLOWER = 4
 
 class HighwayPenaltyWrapper(gym.Wrapper):
 	COLLISION_PENALTY = -1.0
-	FRONT_IDEAL_BONUS = 0.8
-	FRONT_TOO_FAR_PENALTY = -0.7
+	FRONT_TOO_FAR_PENALTY = -0.3
 	FRONT_TOO_NEAR_PENALTY = -0.7
-	FRONT_MISSING_BONUS = 0.2
+	NO_FRONT_DATA_BONUS = 0.2
 	SPEED_BONUS = 0.1
 	SPEED_THRESHOLD = 28.0
-	CHASE_BONUS = 0.5
-	CHASE_DISTANCE_GAIN = 8.0
-	LANE_CHANGE_PENALTY = -0.2
-	LANE_SAFETY_BONUS = 0.6
+	CHASE_LANE_CHANGE_BONUS = 0.5
+	LANE_CHANGE_FAILED_PENALTY = -0.2
+	LANE_SAFETY_SUCCESS_BONUS = 0.2
 	LEFT_BLOCKED_LANE_CHANGE_PENALTY = -0.9
 	RIGHT_BLOCKED_LANE_CHANGE_PENALTY = -0.9
 
 	FRONT_TOO_FAR_DISTANCE = 45.0
 	FRONT_TOO_NEAR_DISTANCE = 30.0
-	IDEAL_FRONT_DISTANCE_MIN = 30.0
-	IDEAL_FRONT_DISTANCE_MAX = 35.0
+	CHASE_DISTANCE_GAIN_THRESHOLD = 8.0
 
+	LANE_WIDTH = 4.0
 	SAME_LANE_Y_THRESHOLD = 2.0
+	ADJACENT_LANE_Y_THRESHOLD = 1.5
 	SIDE_LONGITUDINAL_CHECK = 30.0
+
+	def __init__(self, env):
+		super().__init__(env)
+		self._last_obs = None
 
 	def reset(self, **kwargs):
 		obs, info = self.env.reset(**kwargs)
-		self._sync_previous_state(obs, info)
+		self._last_obs = obs
 		return obs, info
 
 	def step(self, action):
-		ego_before = self.env.unwrapped.vehicle
-		prev_lane_index = self._get_lane_index(ego_before)
-		prev_front_distance = self.prev_front_distance
-		left_occupied_before_change, right_occupied_before_change = self._lane_occupancy_before_change(ego_before, prev_lane_index)
+		prev_obs = self._last_obs
+		prev_lane_id = self._current_lane_id()
+		prev_front_distance = self._front_distance_from_obs(prev_obs)
+		left_occupied_before_change = self._adjacent_lane_has_vehicle(prev_obs, is_left=True)
+		right_occupied_before_change = self._adjacent_lane_has_vehicle(prev_obs, is_left=False)
 
 		obs, reward, terminated, truncated, info = self.env.step(action)
+		self._last_obs = obs
 
-		ego_after = self.env.unwrapped.vehicle
-		current_lane_index = self._get_lane_index(ego_after)
-		current_front_distance = self._front_distance_from_obs(obs)
-		speed = float(info.get("speed", getattr(ego_after, "speed", 0.0)))
-		crashed = bool(info.get("crashed", False))
-		attempted_lane_change = action in (LANE_LEFT, LANE_RIGHT)
-		lane_changed = prev_lane_index is not None and current_lane_index is not None and current_lane_index != prev_lane_index
+		front_distance = self._front_distance_from_obs(obs)
+		post_lane_id = self._current_lane_id()
+		speed = float(info.get("speed", 0.0))
+		is_lane_change_action = action in (LANE_LEFT, LANE_RIGHT)
 
-		adjustment = 0.0
-		bonus = 0.0
+		lane_change_success = self._lane_change_success(action, prev_lane_id, post_lane_id)
+		pursuit_lane_change_success = self._pursuit_lane_change_success(
+			lane_change_success,
+			prev_front_distance,
+			front_distance,
+		)
+		lane_safety_success = self._lane_safety_success(
+			action,
+			lane_change_success,
+			left_occupied_before_change,
+			right_occupied_before_change,
+			pursuit_lane_change_success,
+		)
+
+		penalty = 0.0
 		penalty_terms = {}
-		bonus_terms = {}
 
-		if crashed or terminated:
-			adjustment += self.COLLISION_PENALTY
-			penalty_terms["collision"] = self.COLLISION_PENALTY
+		collision_penalty = self._collision_penalty(info)
+		if collision_penalty != 0.0:
+			penalty += collision_penalty
+			penalty_terms["collision"] = collision_penalty
 
-		if current_front_distance is None:
-			adjustment += self.FRONT_MISSING_BONUS
-			bonus_terms["front_distance_missing"] = self.FRONT_MISSING_BONUS
-		elif current_front_distance > self.FRONT_TOO_FAR_DISTANCE:
-			adjustment += self.FRONT_TOO_FAR_PENALTY
-			penalty_terms["front_distance_too_far"] = self.FRONT_TOO_FAR_PENALTY
-		elif current_front_distance < self.FRONT_TOO_NEAR_DISTANCE:
-			adjustment += self.FRONT_TOO_NEAR_PENALTY
-			penalty_terms["front_distance_too_near"] = self.FRONT_TOO_NEAR_PENALTY
-		elif self.IDEAL_FRONT_DISTANCE_MIN <= current_front_distance <= self.IDEAL_FRONT_DISTANCE_MAX:
-			adjustment += self.FRONT_IDEAL_BONUS
-			bonus_terms["front_distance_ideal"] = self.FRONT_IDEAL_BONUS
+		front_distance_reward = self._front_distance_reward(front_distance)
+		if front_distance_reward != 0.0:
+			penalty += front_distance_reward
+			penalty_terms["front_distance"] = front_distance_reward
 
-		if speed >= self.SPEED_THRESHOLD:
-			adjustment += self.SPEED_BONUS
-			bonus_terms["speed_bonus"] = self.SPEED_BONUS
+		speed_reward = self._speed_reward(speed)
+		if speed_reward != 0.0:
+			penalty += speed_reward
+			penalty_terms["speed"] = speed_reward
 
-		if attempted_lane_change:
-			if not lane_changed:
-				adjustment += self.LANE_CHANGE_PENALTY
-				penalty_terms["lane_change_failed_or_insufficient"] = self.LANE_CHANGE_PENALTY
+		left_blocked_penalty, right_blocked_penalty = self._blocked_lane_change_penalty(
+			action,
+			left_occupied_before_change,
+			right_occupied_before_change,
+		)
+		if left_blocked_penalty != 0.0:
+			penalty += left_blocked_penalty
+			penalty_terms["left_blocked_lane_change"] = left_blocked_penalty
+		if right_blocked_penalty != 0.0:
+			penalty += right_blocked_penalty
+			penalty_terms["right_blocked_lane_change"] = right_blocked_penalty
 
-			if action == LANE_LEFT:
-				if left_occupied_before_change:
-					adjustment += self.LEFT_BLOCKED_LANE_CHANGE_PENALTY
-					penalty_terms["left_occupied_before_change"] = self.LEFT_BLOCKED_LANE_CHANGE_PENALTY
-				elif lane_changed:
-					adjustment += self.LANE_SAFETY_BONUS
-					bonus_terms["lane_safety"] = self.LANE_SAFETY_BONUS
+		if pursuit_lane_change_success:
+			penalty += self.CHASE_LANE_CHANGE_BONUS
+			penalty_terms["pursuit_lane_change"] = self.CHASE_LANE_CHANGE_BONUS
 
-			if action == LANE_RIGHT:
-				if right_occupied_before_change:
-					adjustment += self.RIGHT_BLOCKED_LANE_CHANGE_PENALTY
-					penalty_terms["right_occupied_before_change"] = self.RIGHT_BLOCKED_LANE_CHANGE_PENALTY
-				elif lane_changed:
-					adjustment += self.LANE_SAFETY_BONUS
-					bonus_terms["lane_safety"] = self.LANE_SAFETY_BONUS
+		if lane_safety_success:
+			penalty += self.LANE_SAFETY_SUCCESS_BONUS
+			penalty_terms["lane_safety"] = self.LANE_SAFETY_SUCCESS_BONUS
 
-		if lane_changed and prev_front_distance is not None and attempted_lane_change:
-			if current_front_distance is None:
-				if prev_front_distance <= self.FRONT_TOO_NEAR_DISTANCE:
-					adjustment += self.CHASE_BONUS
-					bonus_terms["chase_lane_gain"] = self.CHASE_BONUS
-			elif prev_front_distance <= self.FRONT_TOO_NEAR_DISTANCE and (current_front_distance - prev_front_distance) >= self.CHASE_DISTANCE_GAIN:
-				adjustment += self.CHASE_BONUS
-				bonus_terms["chase_lane_gain"] = self.CHASE_BONUS
+		if is_lane_change_action and not pursuit_lane_change_success and not lane_safety_success:
+			penalty += self.LANE_CHANGE_FAILED_PENALTY
+			penalty_terms["lane_change"] = self.LANE_CHANGE_FAILED_PENALTY
 
-		shaped_reward = reward + adjustment
+		shaped_reward = reward + penalty
 
 		info["base_reward"] = reward
 		info["shaped_reward"] = shaped_reward
-		info["reward_adjustment"] = adjustment
+		info["penalty"] = penalty
 		info["penalty_terms"] = penalty_terms
-		info["bonus_terms"] = bonus_terms
-		info["front_distance"] = current_front_distance
+		info["front_distance"] = front_distance
 		info["prev_front_distance"] = prev_front_distance
-		info["speed"] = speed
-		info["crashed"] = crashed
 		info["left_occupied_before_change"] = left_occupied_before_change
 		info["right_occupied_before_change"] = right_occupied_before_change
-		info["lane_changed"] = lane_changed
-
-		self._sync_previous_state(obs, info)
+		info["lane_change_success"] = lane_change_success
+		info["pursuit_lane_change_success"] = pursuit_lane_change_success
+		info["lane_safety_success"] = lane_safety_success
 
 		return obs, shaped_reward, terminated, truncated, info
 
-	def _sync_previous_state(self, obs, info):
-		self.prev_front_distance = self._front_distance_from_obs(obs)
-		self.prev_lane_index = self._get_lane_index(getattr(self.env.unwrapped, "vehicle", None))
-		self.prev_speed = float(info.get("speed", getattr(getattr(self.env.unwrapped, "vehicle", None), "speed", 0.0)))
+	def _collision_penalty(self, info):
+		crashed = bool(info.get("crashed", False))
+		if crashed:
+			return self.COLLISION_PENALTY
+		return 0.0
 
-	def _get_lane_index(self, vehicle):
-		if vehicle is None or getattr(vehicle, "lane_index", None) is None:
-			return None
-		return vehicle.lane_index[2]
+	def _front_distance_reward(self, front_distance):
+		if front_distance is None:
+			return self.NO_FRONT_DATA_BONUS
+		if front_distance > self.FRONT_TOO_FAR_DISTANCE:
+			return self.FRONT_TOO_FAR_PENALTY
+		if front_distance < self.FRONT_TOO_NEAR_DISTANCE:
+			return self.FRONT_TOO_NEAR_PENALTY
+		return 0.0
+
+	def _speed_reward(self, speed):
+		if speed >= self.SPEED_THRESHOLD:
+			return self.SPEED_BONUS
+		return 0.0
+
+	def _blocked_lane_change_penalty(self, action, left_has_vehicle, right_has_vehicle):
+		left_penalty = 0.0
+		right_penalty = 0.0
+
+		if action == LANE_LEFT and left_has_vehicle:
+			left_penalty = self.LEFT_BLOCKED_LANE_CHANGE_PENALTY
+		if action == LANE_RIGHT and right_has_vehicle:
+			right_penalty = self.RIGHT_BLOCKED_LANE_CHANGE_PENALTY
+
+		return left_penalty, right_penalty
+
+	def _adjacent_lane_has_vehicle(self, obs, is_left):
+		vehicles = self._valid_non_ego_rows(obs)
+		lane_center = -self.LANE_WIDTH if is_left else self.LANE_WIDTH
+		y_min = lane_center - self.ADJACENT_LANE_Y_THRESHOLD
+		y_max = lane_center + self.ADJACENT_LANE_Y_THRESHOLD
+
+		for row in vehicles:
+			rel_x = row[1]
+			rel_y = row[2]
+			if abs(rel_x) <= self.SIDE_LONGITUDINAL_CHECK and y_min <= rel_y <= y_max:
+				return True
+		return False
 
 	def _front_distance_from_obs(self, obs):
 		vehicles = self._valid_non_ego_rows(obs)
 		front_candidates = [row for row in vehicles if row[1] > 0 and abs(row[2]) <= self.SAME_LANE_Y_THRESHOLD]
-
 		if not front_candidates:
 			return None
-
 		return min(row[1] for row in front_candidates)
 
-	def _lane_occupancy_before_change(self, ego_vehicle, ego_lane_index):
-		if ego_vehicle is None or ego_lane_index is None or getattr(self.env.unwrapped, "road", None) is None:
-			return False, False
-
-		left_target_lane = ego_lane_index - 1
-		right_target_lane = ego_lane_index + 1
-
-		left_occupied = self._lane_has_vehicle(ego_vehicle, left_target_lane)
-		right_occupied = self._lane_has_vehicle(ego_vehicle, right_target_lane)
-
-		return left_occupied, right_occupied
-
-	def _lane_has_vehicle(self, ego_vehicle, target_lane_index):
-		if target_lane_index < 0:
+	@staticmethod
+	def _lane_change_success(action, prev_lane_id, post_lane_id):
+		if prev_lane_id is None or post_lane_id is None:
 			return False
-
-		road = getattr(self.env.unwrapped, "road", None)
-		if road is None:
-			return False
-
-		nearby = road.close_objects_to(
-			ego_vehicle,
-			self.SIDE_LONGITUDINAL_CHECK,
-			count=20,
-			see_behind=True,
-			sort=True,
-			vehicles_only=True,
-		)
-
-		for vehicle in nearby:
-			if vehicle is ego_vehicle:
-				continue
-			if getattr(vehicle, "lane_index", None) is None:
-				continue
-			if vehicle.lane_index[2] != target_lane_index:
-				continue
-			rel = vehicle.to_dict(ego_vehicle)
-			if abs(rel.get("x", 0.0)) <= self.SIDE_LONGITUDINAL_CHECK:
-				return True
-
+		if action == LANE_LEFT:
+			return post_lane_id < prev_lane_id
+		if action == LANE_RIGHT:
+			return post_lane_id > prev_lane_id
 		return False
+
+	def _pursuit_lane_change_success(self, lane_change_success, prev_front_distance, front_distance):
+		if not lane_change_success:
+			return False
+		if prev_front_distance is None or front_distance is None:
+			return False
+		if prev_front_distance > self.FRONT_TOO_NEAR_DISTANCE:
+			return False
+		return (front_distance - prev_front_distance) >= self.CHASE_DISTANCE_GAIN_THRESHOLD
+
+	@staticmethod
+	def _lane_safety_success(
+		action,
+		lane_change_success,
+		left_occupied_before_change,
+		right_occupied_before_change,
+		pursuit_lane_change_success,
+	):
+		if not lane_change_success or pursuit_lane_change_success:
+			return False
+		if action == LANE_LEFT:
+			return not left_occupied_before_change
+		if action == LANE_RIGHT:
+			return not right_occupied_before_change
+		return False
+
+	def _current_lane_id(self):
+		vehicle = getattr(self.env.unwrapped, "vehicle", None)
+		if vehicle is None:
+			return None
+		lane_index = getattr(vehicle, "lane_index", None)
+		if lane_index is None or len(lane_index) < 3:
+			return None
+		return int(lane_index[2])
 
 	@staticmethod
 	def _valid_non_ego_rows(obs):
