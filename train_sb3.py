@@ -14,7 +14,8 @@ from game import HighwayPenaltyWrapper
 TOTAL_TIMESTEPS = 100_000
 RENDER_EVERY_N_STEPS = 1
 RENDER_SLEEP_SECONDS = 0.03
-MODEL_PATH = "highway_dqn"
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "dqn_highway_model")
 CHECKPOINT_DIR = "checkpoints"
 CHECKPOINT_FREQ = 1000
 
@@ -52,6 +53,7 @@ def make_env():
 def main():
     env = DummyVecEnv([make_env()])
 
+    os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     model = DQN(
@@ -85,9 +87,14 @@ def main():
 
     callbacks = CallbackList([callback, checkpoint_callback])
 
-    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks, progress_bar=True)
-    model.save(MODEL_PATH)
-    env.close()
+    try:
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks, progress_bar=True)
+    except KeyboardInterrupt:
+        print("Training interrupted. Saving current model...")
+    finally:
+        model.save(MODEL_PATH)
+        print(f"Model saved to: {MODEL_PATH}.zip")
+        env.close()
 
 
 if __name__ == "__main__":
