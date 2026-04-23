@@ -1,5 +1,6 @@
 import os
 import time
+from glob import glob
 
 import gymnasium as gym
 import highway_env  # noqa: F401
@@ -50,27 +51,59 @@ def make_env():
     return _init
 
 
+def _extract_step_from_checkpoint(path: str) -> int:
+    filename = os.path.basename(path)
+    stem = filename.replace(".zip", "")
+    parts = stem.split("_")
+    if len(parts) < 2:
+        return -1
+    try:
+        return int(parts[-2])
+    except ValueError:
+        return -1
+
+
+def find_latest_model_path() -> str | None:
+    checkpoint_pattern = os.path.join(CHECKPOINT_DIR, "highway_dqn_*_steps.zip")
+    checkpoint_paths = glob(checkpoint_pattern)
+    if checkpoint_paths:
+        checkpoint_paths.sort(key=_extract_step_from_checkpoint)
+        return checkpoint_paths[-1]
+
+    final_model_zip = f"{MODEL_PATH}.zip"
+    if os.path.exists(final_model_zip):
+        return final_model_zip
+
+    return None
+
+
 def main():
     env = DummyVecEnv([make_env()])
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    model = DQN(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=1e-4,
-        buffer_size=50_000,
-        learning_starts=1_000,
-        batch_size=64,
-        gamma=0.99,
-        train_freq=4,
-        gradient_steps=1,
-        target_update_interval=1_000,
-        exploration_fraction=0.2,
-        exploration_final_eps=0.05,
-        verbose=1,
-    )
+    latest_model_path = find_latest_model_path()
+    if latest_model_path is not None:
+        print(f"Loading existing model: {latest_model_path}")
+        model = DQN.load(latest_model_path, env=env)
+    else:
+        print("No existing model found. Starting training from scratch.")
+        model = DQN(
+            policy="MlpPolicy",
+            env=env,
+            learning_rate=1e-4,
+            buffer_size=50_000,
+            learning_starts=1_000,
+            batch_size=64,
+            gamma=0.99,
+            train_freq=4,
+            gradient_steps=1,
+            target_update_interval=1_000,
+            exploration_fraction=0.2,
+            exploration_final_eps=0.05,
+            verbose=1,
+        )
 
     callback = RenderCallback(
         render_every_n_steps=RENDER_EVERY_N_STEPS,
@@ -88,7 +121,12 @@ def main():
     callbacks = CallbackList([callback, checkpoint_callback])
 
     try:
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks, progress_bar=True)
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=callbacks,
+            progress_bar=True,
+            reset_num_timesteps=False,
+        )
     except KeyboardInterrupt:
         print("Training interrupted. Saving current model...")
     finally:
